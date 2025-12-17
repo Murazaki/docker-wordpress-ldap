@@ -3,8 +3,7 @@
 This is a very simple extension to the official wordpress container
 which builds in php-ldap support for ldap-based wordpress logins.
 
-Only `${version}-php7.3-apache` tags are rebuilt, not all the tags
-made available by the official image.
+Building latest, fpm, fpm-alpine and apache, for amd64 et arm64.
 
 This image is provided as-is with no warranty of any kind.
 
