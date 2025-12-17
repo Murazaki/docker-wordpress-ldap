@@ -1,35 +1,220 @@
-name: Docker Image CI
+---
+name: Docker
 
 on:
+  # See: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_dispatch
   workflow_dispatch:
+    inputs:
+      force_rebuild_all:
+        description: will skip existing if false
+        type: boolean
+        default: false
+
+  # See: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#push
   push:
     branches:
-      - master
-    paths:
-      - 'Dockerfile'
-      - '.github/workflows/**'
+      - main
+      - ci/*
+    tags:
+      - "*"
 
-env:
-  IMAGE_NAME: wordpress-ldap
+  # See: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule
+  schedule:
+    #        ┌───────────── minute (0 - 59)
+    #        │  ┌───────────── hour (0 - 23)
+    #        │  │ ┌───────────── day of the month (1 - 31)
+    #        │  │ │ ┌───────────── month (1 - 12 or JAN-DEC)
+    #        │  │ │ │ ┌───────────── day of the week (0 - 6 or SUN-SAT)
+    #        │  │ │ │ │
+    #        │  │ │ │ │
+    #        │  │ │ │ │
+    - cron: "0 12 * * *" # run at 12:00 PM UTC every day
 
 jobs:
-
-  build:
-
+  define-versions:
+    name: Define Versions Variables
     runs-on: ubuntu-latest
 
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag $IMAGE_NAME:latest
+    outputs:
+      wordpress_versions: ${{ steps.wordpress_versions.outputs.versions }}
+      wordpress_ldap_versions: ${{ steps.wordpress_ldap_versions.outputs.versions }}
 
-    - name: Log into registry
-      run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
-  
-    - name: Push image
-      run: |
-          IMAGE_ID=$(echo ${{ github.repository }} | sed -e 's#/.*##')/$IMAGE_NAME
-          BASE_IMAGE_TAG=$(grep 'FROM ' Dockerfile | head -n 1 | sed -e 's#^.*:##')
-          docker tag $IMAGE_NAME:latest $IMAGE_ID:$BASE_IMAGE_TAG
-          docker push $IMAGE_ID:$BASE_IMAGE_TAG
+    env:
+      IMAGE_NAME: wordpress-ldap
+
+    steps:
+      - name: Get tools
+        run: |
+          sudo apt update && \
+          sudo apt install -y --no-install-recommends curl jq golang && \
+          sudo rm -rf /var/lib/apt/lists/*
+          GOBIN=/usr/local/bin/ go install github.com/docker/hub-tool@v0.4.6
+
+      # See: https://github.com/docker/login-action?tab=readme-ov-file#docker-hub
+      - name: Login to Docker Hub registry (conditionally)
+        run: |
+          # Token commands thank to https://stackoverflow.com/a/59334315/5155484
+          HUB_TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d "{\"username\": \"${{ vars.DOCKER_HUB_USERNAME }}\", \"password\": \"$DOCKER_PASSWORD\"}" https://hub.docker.com/v2/users/login/ | jq -r .token)
+          USERNAME="$(printf '%s:' "${{ vars.DOCKER_HUB_USERNAME }}" | base64 -w0)"
+          USER_PASS="$(printf '%s:%s' "${{ vars.DOCKER_HUB_USERNAME }}" "${{ secrets.DOCKER_HUB_TOKEN }}" | base64 -w0)"
+
+          printf '{"auths": {"hub-tool": {"auth": "%s"}, "hub-tool-refresh-token": {"auth": "%s"}, "hub-tool-token": { "auth": "%s", "identitytoken": "%s"}}}' \
+                    "$USER_PASS" "$USERNAME" \
+                    "$USERNAME" "$HUB_TOKEN" \
+                    > ~/.docker/config.json
+
+      - name: Define Latest Wordpress Versions
+        id: wordpress_versions
+        run: |
+          hub-tool tag ls wordpress --all --sort updated --format json \
+            | jq -r --arg prefix "versions=" '
+              $prefix + ([ .[:1000] | .[] // [] | select(.Images[]?.Os|test("linux"))
+              | .Name | capture("wordpress:(?<tag>\\d+\\.\\d+\\.\\d+)").tag ]
+              | map({(.):1}) | add // {} | keys_unsorted | sort_by(. | split(".")
+              | map(tonumber) | 1000000 * .[0] + 1000 * .[1] + .[2]) | reverse
+              | .[:3] | tostring)
+            ' \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Define Latest Wordpress LDAP Versions
+        id: wordpress_ldap_versions
+        run: |
+          curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/users/${{ github.repository_owner }}/packages/container/${{ env.IMAGE_NAME }}/versions?per_page=100 \
+            | jq -r --arg prefix "versions=" '
+              $prefix + ([ .[]?.metadata?.container?.tags // [] | select(.|length != 0)
+              | .[]  | capture("v(?<tag>\\d+\\.\\d+\\.\\d+)").tag ]
+              | map({(.):1}) | add // {} | keys_unsorted | sort_by(. | split(".")
+              | map(tonumber) | 1000000 * .[0] + 1000 * .[1] + .[2]) | reverse | .[:3] | tostring)
+            ' \
+            >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build, Test, and Push
+    runs-on: ubuntu-latest
+
+    needs: define-versions
+
+    strategy:
+      fail-fast: false
+
+      # See: https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs
+      matrix:
+        wordpress_version: ${{ fromJSON(needs.define-versions.outputs.wordpress_versions) }}
+        php_version:
+          - 8.3
+          - 8.4
+          - 8.5
+        phpcgi_provider:
+          - apache
+          - fpm
+          - fpm-alpine
+
+    # See: https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#example-using-concurrency-and-the-default-behavior
+    concurrency:
+      group: docker-build-${{ github.ref }}-${{ matrix.wordpress_version }}-${{ matrix.php_version }}-${{ matrix.phpcgi_provider }}
+      cancel-in-progress: true
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      IMAGE_NAME: wordpress-ldap
+      
+      HAS_DOCKER_HUB_CONFIGURED: ${{ vars.DOCKER_HUB_USERNAME != '' && vars.DOCKER_HUB_ORGANISATION != '' && vars.DOCKER_HUB_REPO != '' && secrets.DOCKER_HUB_TOKEN != '' }}
+
+      LATEST_WORDPRESS_VERSION: ${{ fromJSON(needs.define-versions.outputs.wordpress_versions)[0] }}
+
+      PREFERRED_PHP_VERSION: 8.5
+
+      PREFERRED_PHPCGI_PROVIDER: apache
+
+    if: (github.event_name == 'schedule' && github.repository_owner == 'murazaki') || (github.event_name != 'schedule')
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Print version
+        id: wordpress_version
+        run: |
+          echo "WORDPRESS_VERSION=${{ matrix.wordpress_version }}\n"
+          echo "PHP_VERSION=${{ matrix.php_version }}"
+          echo "PHPCGI_PROVIDER=${{ matrix.phpcgi_provider }}"
+          echo "WORDPRESS_VERSION=${{ matrix.wordpress_version }}\n"
+          echo "PHP_VERSION=${{ matrix.php_version }}"
+          echo "PHPCGI_PROVIDER=${{ matrix.phpcgi_provider }}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        id: buildx
+
+        # See: https://github.com/docker/login-action?tab=readme-ov-file#github-container-registry
+      - name: Log in to the GitHub Container registry
+        if: (!contains(fromJson(needs.define-versions.outputs.wordpress_ldap_versions), matrix.wordpress_version) || github.event.inputs.force_rebuild_all)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+        # See: https://github.com/docker/login-action?tab=readme-ov-file#docker-hub
+      - name: Login to Docker Hub registry (conditionally)
+        if: ${{ env.HAS_DOCKER_HUB_CONFIGURED }} && (!contains(fromJson(needs.define-versions.outputs.wordpress_ldap_versions), matrix.wordpress_version) || github.event.inputs.force_rebuild_all)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Docker meta
+        if: (!contains(fromJson(needs.define-versions.outputs.wordpress_ldap_versions), matrix.wordpress_version) || github.event.inputs.force_rebuild_all)
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: |
+            name=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},enable=true
+            name=${{ vars.DOCKER_HUB_ORGANISATION }}/${{ vars.DOCKER_HUB_REPO }},enable=${{ env.HAS_DOCKER_HUB_CONFIGURED }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') && matrix.wordpress_version == env.LATEST_WORDPRESS_VERSION && matrix.php_version == env.PREFERRED_PHP_VERSION && matrix.phpcgi_provider == env.PREFERRED_PHPCGI_PROVIDER }}
+            type=raw,value=latest,suffix=-${{ matrix.phpcgi_provider }},enable=${{ github.ref == format('refs/heads/{0}', 'main') && matrix.wordpress_version == env.LATEST_WORDPRESS_VERSION && matrix.php_version == env.PREFERRED_PHP_VERSION }}
+            type=raw,value=latest,suffix=-php${{ matrix.php_version }}-${{ matrix.phpcgi_provider }},enable=${{ github.ref == format('refs/heads/{0}', 'main') && matrix.wordpress_version == env.LATEST_WORDPRESS_VERSION }}
+            type=semver,pattern=raw,value=${{ matrix.wordpress_version }},enable=${{ matrix.php_version == env.PREFERRED_PHP_VERSION && matrix.phpcgi_provider == env.PREFERRED_PHPCGI_PROVIDER }}
+            type=semver,pattern=raw,value=${{ matrix.wordpress_version }}-${{ matrix.phpcgi_provider }},enable=${{ matrix.php_version == env.PREFERRED_PHP_VERSION }}
+            type=semver,pattern=raw,value=${{ matrix.wordpress_version }}-php${{ matrix.php_version }}-${{ matrix.phpcgi_provider }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+
+      - name: Build and push Docker image
+        if: (!contains(fromJson(needs.define-versions.outputs.wordpress_ldap_versions), matrix.wordpress_version) || github.event.inputs.force_rebuild_all)
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          builder: ${{ steps.buildx.outputs.name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          push: true
+          sbom: true
+          provenance: true
+          build-args: |
+            WORDPRESS_VERSION=${{ matrix.wordpress_version }}
+            PHP_VERSION=${{ matrix.php_version }}
+            PHPCGI_PROVIDER=${{ matrix.phpcgi_provider }}
+          cache-from: type=gha,scope=${{ matrix.wordpress_version }}--${{ matrix.phpcgi_provider }}-${{ matrix.php_version }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.wordpress_version }}--${{ matrix.phpcgi_provider }}-${{ matrix.php_version }}
+
+      - uses: 'actions/attest-build-provenance@v2'
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
